@@ -4,32 +4,64 @@ require 'net/ssh' # Monkeypatching
 
 class Class
   unless method_defined?(:alias_method_once)
+    # Create an alias +new_method+ to +old_method+ unless +new_method+ is already defined.
     def alias_method_once(new_method, old_method)
       alias_method new_method, old_method unless method_defined?(new_method)
     end
   end
 end
 
-module Net::SSH
-  module Process
+module Net::SSH # :nodoc:
+  module Process # :nodoc:
+    # Encapsulates the information on the status of terminated remote process, similar to Process::Status.
+    #
+    # Note that it's impossible to retrieve PID (process ID) via an SSH channel (thus impossible to properly signal it).
+    #
+    # Although RFC4254 allows sending signals to the process (see http://tools.ietf.org/html/rfc4254#section-6.9),
+    # current OpenSSH server implementation does not support this feature, though there are some patches:
+    # https://bugzilla.mindrot.org/show_bug.cgi?id=1424 and http://marc.info/?l=openssh-unix-dev&m=104300802407848&w=2
+    #
+    # As a workaround you can request a PTY and send SIGINT or SIGQUIT via ^C, ^\ or other sequences,
+    # see 'pty' option in Net::SSH::Open3 for more information.
     class Status
+      # Integer exit code in range 0..255, 0 usually meaning success.
+      # Assigned only if the process has exited normally (i.e. not by a signal).
+      # More information about standard exit codes: http://tldp.org/LDP/abs/html/exitcodes.html
       attr_reader :exitstatus
 
+      # true when process has been killed by a signal and a core dump has been generated for it.
       def coredump?
         @coredump
       end 
 
+      # Integer representation of a signal that killed a process, if available.
+      #
+      # Translated to local system (so you can use Signal.list to map it to String).
+      # Explanation: when local system is Linux (USR1=10) and remote is FreeBSD (USR1=30),
+      # 10 will be returned in case remote process receives USR1 (30).
+      #
+      # Not all signal names are delivered by ssh: for example, SIGTRAP is delivered as "SIG@openssh.com"
+      # and therefore may not be translated. Returns String in this case.
       def termsig
         Signal.list[@termsig] || @termsig
       end
 
-      alias_method :exited?, :exitstatus
-      alias_method :signaled?, :termsig
+      # true if the process has returned an exit code rather than being killed by a signal.
+      def exited?
+        !!@exitstatus
+      end
 
+      # true if the process has been killed by a signal, as opposed to returning an exit code.
+      def signaled?
+        !!@termsig
+      end
+
+      # Returns true if the process has exited with code 0, false for other codes and nil if killed by a signal.
       def success?
         exited? ? exitstatus == 0 : nil
       end
 
+      # String representation of exit status.
       def to_s
         if exited?
           "exit #@exitstatus"
@@ -40,52 +72,91 @@ module Net::SSH
         end
       end
 
-      def inspect
+      def inspect # :nodoc:
         "#<#{self.class}: #{to_s}>"
       end
     end
   end
 
+  # Net::SSH Open3 extensions.
+  # All methods have the same argument list.
+  #
+  # *optional* +env+: custom environment variables +Hash+. Note that SSH server typically restricts changeable variables to a very small set,
+  # e.g. for OpenSSH see +AcceptEnv+ in +/etc/ssh/sshd_config+ (+AcceptEnv+ +LANG+ +LC_*+)
+  #
+  # +command+: a single shell command (like in +sh+ +-c+), or an executable program.
+  #
+  # *optional* +arg1+, +arg2+, +...+: arguments to an executable mentioned above.
+  #
+  # *optional* +options+: options hash, keys:
+  # * +redirects+: Hash of redirections which will be appended to a command line (you can't transfer a pipe to a remote system).
+  #   Key: one of +:in+, +:out+, +:err+ or a +String+, value: +Integer+ to redirect to fd, +String+ to redirect to a file.
+  #   Example:
+  #     { '>>' => '/tmp/log', err: 1 }
+  #   translates to
+  #     '>>/tmp/log 2>&1'
+  # * +channel_retries+: +Integer+ number of retries in case of channel open failure (ssh server usually limits a session to 10 channels),
+  #   or an array of [+retries+, +delay+]
+  # * +stdin_data+: for +capture*+ only, specifies data to be immediately sent to +stdin+ of a remote process.
+  #   stdin is immediately closed then.
+  # * +logger+: an object which responds to +debug/info/warn/error+ and optionally +init/stdin/stdout/stderr+ to log debug information
+  #   and data exchange stream
+  # * +pty+: true or a +Hash+ of PTY settings to request a pseudo-TTY, see Net::SSH documentation for more information.
+  #   A note about sending TERM/QUIT: use modes, e.g.:
+  #     Net::SSH.start('localhost', ENV['USER']).capture2e('cat', pty: {
+  #         modes: {
+  #           Net::SSH::Connection::Term::VINTR => 0x01020304, # INT on this 4-byte-sequence
+  #           Net::SSH::Connection::Term::VQUIT => 0xdeadbeef, # QUIT on this 4-byte sequence
+  #           Net::SSH::Connection::Term::VEOF => 0xfacefeed, # EOF sequence
+  #           Net::SSH::Connection::Term::ECHO => 0, # disable echoing
+  #           Net::SSH::Connection::Term::ISIG => 1 # enable sending signals
+  #         }
+  #       },
+  #       stdin_data: [0xDEADBEEF].pack('L'),
+  #       logger: Class.new { alias method_missing puts; def respond_to?(_); true end }.new)
+  #     # log skipped ...
+  #     # => ["", #<Net::SSH::Process::Status: QUIT (signal 3) core true>]
+  #   Note that just closing stdin is not enough for PTY. You should explicitly send VEOF as a first char of a line, see termios(3).
   module Open3
-    SSH_EXTENDED_DATA_STDERR = 1
-    REMOTE_PACKET_THRESHOLD = 512 # headers etc
+    SSH_EXTENDED_DATA_STDERR = 1 # :nodoc:
+    REMOTE_PACKET_THRESHOLD = 512 # headers etc # :nodoc:
 
-    def popen3(*args, &block)
+    # Captures stdout only. Returns [String, Process::Status]
+    def capture2(*args)
       stdin_inner, stdin_outer = IO.pipe
       stdout_outer, stdout_inner = IO.pipe
-      stderr_outer, stderr_inner = IO.pipe
+
+      stdin_data = args.last[:stdin_data] if Hash === args.last
 
       run_popen(*args,
                 stdin: stdin_inner,
                 stdout: stdout_inner,
-                stderr: stderr_inner,
-                block_pipes: [stdin_outer, stdout_outer, stderr_outer],
-                &block)
+                block_pipes: [stdin_outer, stdout_outer]) do |stdin, stdout, waiter_thread|
+        stdin.write(stdin_data) if stdin_data
+        stdin.close
+        [stdout.read, waiter_thread.value]
+      end
     end
 
-    def popen2e(*args, &block)
+    # Captures stdout and stderr into one string. Returns [String, Process::Status]
+    def capture2e(*args)
       stdin_inner, stdin_outer = IO.pipe
       stdout_outer, stdout_inner = IO.pipe
+
+      stdin_data = args.last[:stdin_data] if Hash === args.last
 
       run_popen(*args,
                 stdin: stdin_inner,
                 stdout: stdout_inner,
                 stderr: stdout_inner,
-                block_pipes: [stdin_outer, stdout_outer],
-                &block)
+                block_pipes: [stdin_outer, stdout_outer]) do |stdin, stdout, waiter_thread|
+        stdin.write(stdin_data) if stdin_data
+        stdin.close
+        [stdout.read, waiter_thread.value]
+      end
     end
 
-    def popen2(*args, &block)
-      stdin_inner, stdin_outer = IO.pipe
-      stdout_outer, stdout_inner = IO.pipe
-
-      run_popen(*args,
-                stdin: stdin_inner,
-                stdout: stdout_inner,
-                block_pipes: [stdin_outer, stdout_outer],
-                &block)
-    end
-
+    # Captures stdout and stderr into separate strings. Returns [String, String, Process::Status]
     def capture3(*args)
       stdin_inner, stdin_outer = IO.pipe
       stdout_outer, stdout_inner = IO.pipe
@@ -104,40 +175,48 @@ module Net::SSH
       end
     end
 
-    def capture2e(*args)
+    # Opens pipes to a remote process.
+    # Yields +stdin+, +stdout+, +stderr+, +waiter_thread+ into a block. Will wait for a process to finish.
+    # Joining (or getting a value of) +waither_thread+ inside a block will wait for a process right there.
+    def popen3(*args, &block)
       stdin_inner, stdin_outer = IO.pipe
       stdout_outer, stdout_inner = IO.pipe
+      stderr_outer, stderr_inner = IO.pipe
 
-      stdin_data = args.last[:stdin_data] if Hash === args.last
+      run_popen(*args,
+                stdin: stdin_inner,
+                stdout: stdout_inner,
+                stderr: stderr_inner,
+                block_pipes: [stdin_outer, stdout_outer, stderr_outer],
+                &block)
+    end
+
+    # Yields +stdin+, +stdout-stderr+, +waiter_thread+ into a block.
+    def popen2e(*args, &block)
+      stdin_inner, stdin_outer = IO.pipe
+      stdout_outer, stdout_inner = IO.pipe
 
       run_popen(*args,
                 stdin: stdin_inner,
                 stdout: stdout_inner,
                 stderr: stdout_inner,
-                block_pipes: [stdin_outer, stdout_outer]) do |stdin, stdout, waiter_thread|
-        stdin.write(stdin_data) if stdin_data
-        stdin.close
-        [stdout.read, waiter_thread.value]
-      end
+                block_pipes: [stdin_outer, stdout_outer],
+                &block)
     end
 
-    def capture2(*args)
+    # Yields +stdin+, +stdout+, +waiter_thread+ into a block.
+    def popen2(*args, &block)
       stdin_inner, stdin_outer = IO.pipe
       stdout_outer, stdout_inner = IO.pipe
-
-      stdin_data = args.last[:stdin_data] if Hash === args.last
 
       run_popen(*args,
                 stdin: stdin_inner,
                 stdout: stdout_inner,
-                block_pipes: [stdin_outer, stdout_outer]) do |stdin, stdout, waiter_thread|
-        stdin.write(stdin_data) if stdin_data
-        stdin.close
-        [stdout.read, waiter_thread.value]
-      end
+                block_pipes: [stdin_outer, stdout_outer],
+                &block)
     end
 
-    module NetSSHThreadSafeExtensions
+    module NetSSHThreadSafeExtensions # :nodoc: all
       module Session
         def pinger_pipes
           @pinger_pipes ||= IO.pipe
@@ -198,7 +277,7 @@ module Net::SSH
         channel.open3_waiter_thread[:status].tap do |status|
           status.instance_variable_set(:@termsig, data.read_string)
           status.instance_variable_set(:@coredump, data.read_bool)
-          logger.debug("exit signal arrived: #{status.termsig.inspect}, core #{status.coredump?}")
+          logger.debug("exit signal arrived: #{status.termsig.inspect}, core #{status.coredump?}") if logger
         end
       end
 
@@ -210,30 +289,30 @@ module Net::SSH
       channel.on_close do
         logger.debug('channel close command received, will enforce EOF afterwards') if logger
         if stdin
-          options[:net_ssh_session].stop_listening_to(stdin)
+          self.stop_listening_to(stdin)
           stdin.close unless stdin.closed?
         end
         channel.do_eof # Should already be done, but just in case.
       end
 
       if stdin
-        send_packet_size = [1024, options[:net_ssh_channel].remote_maximum_packet_size - REMOTE_PACKET_THRESHOLD].max
+        send_packet_size = [1024, channel.remote_maximum_packet_size - REMOTE_PACKET_THRESHOLD].max
         logger.debug("will split stdin into packets with size = #{send_packet_size}") if logger
-        options[:net_ssh_session].listen_to(stdin) do
+        self.listen_to(stdin) do
           begin
             data = stdin.readpartial(send_packet_size)
             logger.stdin(data) if logger.respond_to?(:stdin)
             channel.send_data(data)
           rescue EOFError
             logger.debug('sending EOF command') if logger
-            options[:net_ssh_session].stop_listening_to(stdin)
+            self.stop_listening_to(stdin)
             channel.eof!
           end
         end
       end
     end
 
-    REDIRECT_MAPPING = {
+    REDIRECT_MAPPING = { # :nodoc:
       in: '<',
       out: '>',
       err: '2>'
@@ -253,20 +332,17 @@ module Net::SSH
       retries ||= 5
       delay ||= 1
 
-      net_ssh_session = options[:net_ssh_session] || self
-      logger.init(host: net_ssh_session.transport.host_as_string, cmdline: cmdline,
+      logger.init(host: self.transport.host_as_string, cmdline: cmdline,
                   env: env, pty: pty_options) if logger.respond_to?(:init)
 
       begin
-        channel = net_ssh_session.open3_open_channel do |channel|
+        channel = self.open3_open_channel do |channel|
           channel.request_pty(Hash === pty_options ? pty_options : {}) if pty_options
           env.each_pair { |var_name, var_value| channel.env(var_name, var_value) }
 
           channel.exec cmdline
 
           install_channel_callbacks channel,
-            net_ssh_session: net_ssh_session,
-            net_ssh_channel: channel,
             stdin: internal_options[:stdin],
             stdout: internal_options[:stdout],
             stderr: internal_options[:stderr],
@@ -296,7 +372,7 @@ module Net::SSH
     end
   end
 
-  class Connection::Session
+  class Connection::Session # :nodoc: all
     include Open3
 
     alias_method_once :initialize_without_open3, :initialize
@@ -367,7 +443,7 @@ module Net::SSH
     end
   end
 
-  class Connection::Channel
+  class Connection::Channel # :nodoc: all
     attr_reader :open3_close_semaphore, :open3_exception, :open3_waiter_thread
 
     alias_method_once :initialize_without_open3, :initialize
