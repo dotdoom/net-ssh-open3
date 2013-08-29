@@ -21,13 +21,15 @@ module Net::SSH # :nodoc:
     # current OpenSSH server implementation does not support this feature, though there are some patches:
     # https://bugzilla.mindrot.org/show_bug.cgi?id=1424 and http://marc.info/?l=openssh-unix-dev&m=104300802407848&w=2
     #
-    # As a workaround you can request a PTY and send SIGINT or SIGQUIT via ^C, ^\ or other sequences,
+    # As a workaround one can request a PTY and send SIGINT or SIGQUIT via ^C, ^\ or other sequences,
     # see 'pty' option in Net::SSH::Open3 for more information.
+    #
+    # Open3 prepends your command with 'echo $$; ' which will echo PID of your process, then intercepts this line from STDOUT.
     class Status
       # Integer exit code in range 0..255, 0 usually meaning success.
       # Assigned only if the process has exited normally (i.e. not by a signal).
       # More information about standard exit codes: http://tldp.org/LDP/abs/html/exitcodes.html
-      attr_reader :exitstatus
+      attr_reader :exitstatus, :pid
 
       # true when process has been killed by a signal and a core dump has been generated for it.
       def coredump?
@@ -63,6 +65,7 @@ module Net::SSH # :nodoc:
 
       # String representation of exit status.
       def to_s
+        (@pid ? "pid #@pid " : '') <<
         if exited?
           "exit #@exitstatus"
         elsif signaled?
@@ -216,29 +219,11 @@ module Net::SSH # :nodoc:
                 &block)
     end
 
-    module NetSSHThreadSafeExtensions # :nodoc: all
-      module Session
-        def pinger_pipes
-          @pinger_pipes ||= IO.pipe
-        end
-
-        def self.apply_to(session)
-          unless session.respond_to?(:pinger_pipes)
-          end
-        end
-      end
-
-      module Channel
-        def close_semaphore
-          @close_semaphore ||= ConditionVariable.new
-        end
-      end
-    end
-
     private
     def install_channel_callbacks(channel, options)
       logger, stdin, stdout, stderr =
         options[:logger], options[:stdin], options[:stdout], options[:stderr]
+      pid_initialized = false
 
       channel.on_open_failed do |_channel, code, desc|
         message = "cannot open channel (error code #{code}): #{desc}"
@@ -247,6 +232,13 @@ module Net::SSH # :nodoc:
       end
 
       channel.on_data do |_channel, data|
+        unless pid_initialized
+          # First arrived line contains PID (see run_popen).
+          pid_initialized = true
+          pid, data = data.split(nil, 2)
+          channel.open3_waiter_thread[:status].instance_variable_set(:@pid, pid.to_i)
+          next if data.empty?
+        end
         logger.stdout(data) if logger.respond_to?(:stdout)
         if stdout
           stdout.write(data)
@@ -340,7 +332,7 @@ module Net::SSH # :nodoc:
           channel.request_pty(Hash === pty_options ? pty_options : {}) if pty_options
           env.each_pair { |var_name, var_value| channel.env(var_name, var_value) }
 
-          channel.exec cmdline
+          channel.exec("echo $$; #{cmdline}")
 
           install_channel_callbacks channel,
             stdin: internal_options[:stdin],
@@ -379,29 +371,31 @@ module Net::SSH # :nodoc:
     def initialize(*args, &block)
       initialize_without_open3(*args, &block)
 
-      # #ping method will pull waiter thread out of select(2) call
+      @open3_channels_mutex = Mutex.new
+      @open3_channels_semaphore = ConditionVariable.new
+
+      # open3_ping method will pull waiter thread out of select(2) call
       # to update watched Channels and IOs and process incomes.
       pinger_reader, @open3_pinger_writer = IO.pipe
       listen_to(pinger_reader) { pinger_reader.readpartial(1) }
 
-      @open3_channels_mutex = Mutex.new
-      @open3_channels_semaphore = ConditionVariable.new
+#TODO(artem): kill this thread on close
 
       @session_loop = Thread.new do
-        @open3_channels_mutex.synchronize do
-          begin
+        while not closed?
+          @open3_channels_mutex.synchronize do
             break unless preprocess { not closed? } # This may remove some channels.
             @open3_channels_semaphore.wait(@open3_channels_mutex) if channels.empty?
-
-            r = listeners.keys
-            w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
-            readers, writers, = Compat.io_select(r, w, nil, nil)
-
-            break unless postprocess(readers, writers) { closed? }
-          rescue ChannelOpenFailed
-            # Ignore this error; it should be passed to the corresponding thread.
           end
-        end while not closed?
+
+          r = listeners.keys
+          w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
+          readers, writers, = Compat.io_select(r, w, nil, nil)
+
+          @open3_channels_mutex.synchronize do
+            break unless postprocess(readers, writers) { closed? }
+          end
+        end
         channels.each do |_id, channel|
           @open3_channels_mutex.synchronize do
             channel.open3_signal_open
