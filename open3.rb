@@ -48,14 +48,19 @@ module Net::SSH # :nodoc:
         Signal.list[@termsig] || @termsig
       end
 
-      # true if the process has returned an exit code rather than being killed by a signal.
+      # true if the process has exited normally and returned an exit code.
       def exited?
         !!@exitstatus
       end
 
-      # true if the process has been killed by a signal, as opposed to returning an exit code.
+      # true if the process has been killed by a signal.
       def signaled?
         !!@termsig
+      end
+
+      # true if the process is still running (actually if we haven't received it's exit status or signal).
+      def active?
+        not (exited? or signaled?)
       end
 
       # Returns true if the process has exited with code 0, false for other codes and nil if killed by a signal.
@@ -65,11 +70,15 @@ module Net::SSH # :nodoc:
 
       # String representation of exit status.
       def to_s
-        (@pid ? "pid #@pid " : '') <<
-        if exited?
-          "exit #@exitstatus"
-        elsif signaled?
-          "#@termsig (signal #{termsig}) core #@coredump"
+        if @pid
+          "pid #@pid " <<
+          if exited?
+            "exit #@exitstatus"
+          elsif signaled?
+            "#@termsig (signal #{termsig}) core #@coredump"
+          else
+            'active'
+          end
         else
           'uninitialized'
         end
@@ -237,6 +246,7 @@ module Net::SSH # :nodoc:
           pid_initialized = true
           pid, data = data.split(nil, 2)
           channel.open3_waiter_thread[:status].instance_variable_set(:@pid, pid.to_i)
+          channel.open3_signal_open
           next if data.empty?
         end
         logger.stdout(data) if logger.respond_to?(:stdout)
@@ -349,7 +359,11 @@ module Net::SSH # :nodoc:
         end
       end
       logger.debug('channel is open and ready, calling user-defined block') if logger
-      yield(*internal_options[:block_pipes], channel.open3_waiter_thread).tap { channel.wait }
+      begin
+        yield(*internal_options[:block_pipes], channel.open3_waiter_thread)
+      ensure
+        channel.wait
+      end
     ensure
       [
         *internal_options[:block_pipes],
@@ -379,31 +393,8 @@ module Net::SSH # :nodoc:
       pinger_reader, @open3_pinger_writer = IO.pipe
       listen_to(pinger_reader) { pinger_reader.readpartial(1) }
 
-#TODO(artem): kill this thread on close
-
-      @session_loop = Thread.new do
-        while not closed?
-          @open3_channels_mutex.synchronize do
-            break unless preprocess { not closed? } # This may remove some channels.
-            @open3_channels_semaphore.wait(@open3_channels_mutex) if channels.empty?
-          end
-
-          r = listeners.keys
-          w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
-          readers, writers, = Compat.io_select(r, w, nil, nil)
-
-          @open3_channels_mutex.synchronize do
-            break unless postprocess(readers, writers) { closed? }
-          end
-        end
-        channels.each do |_id, channel|
-          @open3_channels_mutex.synchronize do
-            channel.open3_signal_open
-            channel.open3_signal_close
-            channel.do_close
-          end
-        end
-      end
+      # TODO(artem): kill this thread on program exit
+      @session_loop = Thread.new { open3_loop }
     end
 
     def open3_open_channel(type = 'session', *extra, &on_confirm)
@@ -418,6 +409,7 @@ module Net::SSH # :nodoc:
                               :long, channel.local_maximum_packet_size, *extra)
             send_message(msg)
             channels[local_id] = channel
+            open3_ping
 
             @open3_channels_semaphore.signal
             channel.open3_close_semaphore.wait(@open3_channels_mutex) if channels.key?(channel.local_id)
@@ -426,7 +418,6 @@ module Net::SSH # :nodoc:
           status
         end
 
-        open3_ping
         channel
       end
     end
@@ -434,6 +425,32 @@ module Net::SSH # :nodoc:
     private
     def open3_ping
       @open3_pinger_writer.write(?P)
+    end
+
+    def open3_loop
+      r, w = nil
+      while not closed?
+        @open3_channels_mutex.synchronize do
+          break unless preprocess { not closed? } # This may remove some channels.
+          @open3_channels_semaphore.wait(@open3_channels_mutex) if channels.empty?
+          r = listeners.keys
+          w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
+        end
+
+        readers, writers, = Compat.io_select(r, w, nil, nil)
+        postprocess(readers, writers)
+      end
+
+      channels.each do |_id, channel|
+        @open3_channels_mutex.synchronize do
+          channel.open3_signal_open
+          channel.open3_signal_close
+          channel.do_close
+        end
+      end
+    rescue
+      puts listeners.keys.map(&:object_id).inspect
+      warn "Caught exception in an Open3 loop: #$!; thread terminating, connections will hang."
     end
   end
 
@@ -461,10 +478,9 @@ module Net::SSH # :nodoc:
     alias_method_once :do_open_confirmation_without_open3, :do_open_confirmation
     def do_open_confirmation(*args)
       do_open_confirmation_without_open3(*args)
+      # Do not signal right now: we will signal as soon as PID arrives.
     rescue
       @open3_exception = $!
-    ensure
-      open3_signal_open
     end
 
     alias_method_once :do_open_failed_without_open3, :do_open_failed
