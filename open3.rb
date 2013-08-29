@@ -323,7 +323,7 @@ module Net::SSH # :nodoc:
     def run_popen(*args, internal_options)
       options = (args.pop if Hash === args.last) || {}
       env = (args.shift if Hash === args.first) || {}
-      cmdline = args.size == 1 ? args.first : Shellwords.join(args)
+      cmdline = args.size == 1 ? args.first : Shellwords.join(args.map(&:to_s))
 
       redirects = options[:redirects] and redirects.each_pair do |fd_and_dir, destination|
         cmdline += " #{REDIRECT_MAPPING[fd_and_dir] || fd_and_dir}#{popen_io_name(destination)}"
