@@ -382,7 +382,6 @@ module Net::SSH # :nodoc:
       initialize_without_open3(*args, &block)
 
       @open3_channels_mutex = Mutex.new
-      @open3_channels_semaphore = ConditionVariable.new
 
       # open3_ping method will pull waiter thread out of select(2) call
       # to update watched Channels and IOs and process incomes.
@@ -407,7 +406,6 @@ module Net::SSH # :nodoc:
             channels[local_id] = channel
             open3_ping
 
-            @open3_channels_semaphore.signal
             channel.open3_close_semaphore.wait(@open3_channels_mutex) if channels.key?(channel.local_id)
           end
           raise *channel.open3_exception if channel.open3_exception
@@ -428,7 +426,6 @@ module Net::SSH # :nodoc:
       while not closed?
         @open3_channels_mutex.synchronize do
           break unless preprocess { not closed? } # This may remove some channels.
-          @open3_channels_semaphore.wait(@open3_channels_mutex) if channels.empty?
           r = listeners.keys
           w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
         end
