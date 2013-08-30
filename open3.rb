@@ -1,6 +1,9 @@
 require 'shellwords' # String#shellescape
 require 'thread' # ConditionVariable
 require 'net/ssh' # Monkeypatching
+require 'stringio' # StringIO for capture*
+
+# TODO: allow passing pipes? watch closing
 
 class Class
   unless method_defined?(:alias_method_once)
@@ -135,61 +138,50 @@ module Net::SSH # :nodoc:
 
     # Captures stdout only. Returns [String, Process::Status]
     def capture2(*args)
-      stdin_inner, stdin_outer = IO.pipe
-      stdout_outer, stdout_inner = IO.pipe
-
+      stdout = StringIO.new
       stdin_data = args.last[:stdin_data] if Hash === args.last
 
       run_popen(*args,
-                stdin: stdin_inner,
-                stdout: stdout_inner,
-                block_pipes: [stdin_outer, stdout_outer]) do |stdin, stdout, waiter_thread|
-        stdin.write(stdin_data) if stdin_data
-        stdin.close
-        [stdout.read, waiter_thread.value]
+                stdin: stdin_data,
+                stdout: stdout,
+                block_pipes: [stdout]) do |stdout, waiter_thread|
+        [stdout.string, waiter_thread.value]
       end
     end
 
     # Captures stdout and stderr into one string. Returns [String, Process::Status]
     def capture2e(*args)
-      stdin_inner, stdin_outer = IO.pipe
-      stdout_outer, stdout_inner = IO.pipe
-
+      stdout = StringIO.new
       stdin_data = args.last[:stdin_data] if Hash === args.last
 
       run_popen(*args,
-                stdin: stdin_inner,
-                stdout: stdout_inner,
-                stderr: stdout_inner,
-                block_pipes: [stdin_outer, stdout_outer]) do |stdin, stdout, waiter_thread|
-        stdin.write(stdin_data) if stdin_data
-        stdin.close
-        [stdout.read, waiter_thread.value]
+                stdin: stdin_data,
+                stdout: stdout,
+                stderr: stdout,
+                block_pipes: [stdout]) do |stdout, waiter_thread|
+        [stdout.string, waiter_thread.value]
       end
     end
 
     # Captures stdout and stderr into separate strings. Returns [String, String, Process::Status]
     def capture3(*args)
-      stdin_inner, stdin_outer = IO.pipe
-      stdout_outer, stdout_inner = IO.pipe
-      stderr_outer, stderr_inner = IO.pipe
-
+      stdout, stderr = StringIO.new, StringIO.new
       stdin_data = args.last[:stdin_data] if Hash === args.last
 
       run_popen(*args,
-                stdin: stdin_inner,
-                stdout: stdout_inner,
-                stderr: stderr_inner,
-                block_pipes: [stdin_outer, stdout_outer, stderr_outer]) do |stdin, stdout, stderr, waiter_thread|
-        stdin.write(stdin_data) if stdin_data
-        stdin.close
-        [stdout.read, stderr.read, waiter_thread.value]
+                stdin: stdin_data,
+                stdout: stdout,
+                stderr: stderr,
+                block_pipes: [stdout, stderr]) do |stdout, stderr, waiter_thread|
+        [stdout.string, stderr.string, waiter_thread.value]
       end
     end
 
     # Opens pipes to a remote process.
     # Yields +stdin+, +stdout+, +stderr+, +waiter_thread+ into a block. Will wait for a process to finish.
     # Joining (or getting a value of) +waither_thread+ inside a block will wait for a process right there.
+    # Careful: don't forget to read +stderr+, otherwise if your process generates too much stderr output
+    # the pipe may overload and ssh loop will get stuck writing to it.
     def popen3(*args, &block)
       stdin_inner, stdin_outer = IO.pipe
       stdout_outer, stdout_inner = IO.pipe
@@ -290,14 +282,14 @@ module Net::SSH # :nodoc:
 
       channel.on_close do
         logger.debug('channel close command received, will enforce EOF afterwards') if logger
-        if stdin
+        if stdin.is_a?(IO)
           self.stop_listening_to(stdin)
           stdin.close unless stdin.closed?
         end
         channel.do_eof # Should already be done, but just in case.
       end
 
-      if stdin
+      if stdin.is_a?(IO)
         send_packet_size = [1024, channel.remote_maximum_packet_size - REMOTE_PACKET_THRESHOLD].max
         logger.debug("will split stdin into packets with size = #{send_packet_size}") if logger
         self.listen_to(stdin) do
@@ -311,6 +303,10 @@ module Net::SSH # :nodoc:
             channel.eof!
           end
         end
+      elsif stdin.is_a?(String)
+        logger.stdin(stdin) if logger.respond_to?(:stdin)
+        channel.send_data(stdin)
+        channel.eof!
       end
     end
 
@@ -370,7 +366,7 @@ module Net::SSH # :nodoc:
         internal_options[:stdin],
         internal_options[:stdout],
         internal_options[:stderr]
-      ].each { |io| io.close if io && !io.closed? }
+      ].each { |io| io.close if io.is_a?(IO) && !io.closed? }
     end
 
     def popen_io_name(name)
