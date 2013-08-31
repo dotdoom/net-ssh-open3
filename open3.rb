@@ -130,7 +130,7 @@ module Net::SSH # :nodoc:
   #       stdin_data: [0xDEADBEEF].pack('L'),
   #       logger: Class.new { alias method_missing puts; def respond_to?(_); true end }.new)
   #     # log skipped ...
-  #     # => ["", #<Net::SSH::Process::Status: QUIT (signal 3) core true>]
+  #     # => ["", #<Net::SSH::Process::Status: pid 1744 QUIT (signal 3) core true>]
   #   Note that just closing stdin is not enough for PTY. You should explicitly send VEOF as a first char of a line, see termios(3).
   module Open3
     SSH_EXTENDED_DATA_STDERR = 1 # :nodoc:
