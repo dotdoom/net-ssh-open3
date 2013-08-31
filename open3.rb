@@ -442,7 +442,6 @@ module Net::SSH # :nodoc:
         end
       end
     rescue
-      puts listeners.keys.map(&:object_id).inspect
       warn "Caught exception in an Open3 loop: #$!; thread terminating, connections will hang."
     end
   end
