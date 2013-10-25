@@ -16,7 +16,7 @@ end
 
 module Net::SSH # :nodoc:
   module Process # :nodoc:
-    # Encapsulates the information on the status of terminated remote process, similar to Process::Status.
+    # Encapsulates the information on the status of remote process, similar to ::Process::Status.
     #
     # Note that it's impossible to retrieve PID (process ID) via an SSH channel (thus impossible to properly signal it).
     #
