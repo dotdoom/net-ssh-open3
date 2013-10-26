@@ -5,17 +5,17 @@ require 'stringio' # StringIO for capture*
 
 # TODO: allow passing pipes? watch closing
 
-class Class
+class Class #:nodoc:
   unless method_defined?(:alias_method_once)
     # Create an alias +new_method+ to +old_method+ unless +new_method+ is already defined.
-    def alias_method_once(new_method, old_method)
+    def alias_method_once(new_method, old_method) #:nodoc:
       alias_method new_method, old_method unless method_defined?(new_method)
     end
   end
 end
 
-module Net::SSH # :nodoc:
-  module Process # :nodoc:
+module Net::SSH #:nodoc:
+  module Process #:nodoc:
     # Encapsulates the information on the status of remote process, similar to ::Process::Status.
     #
     # Note that it's impossible to retrieve PID (process ID) via an SSH channel (thus impossible to properly signal it).
@@ -32,7 +32,11 @@ module Net::SSH # :nodoc:
       # Integer exit code in range 0..255, 0 usually meaning success.
       # Assigned only if the process has exited normally (i.e. not by a signal).
       # More information about standard exit codes: http://tldp.org/LDP/abs/html/exitcodes.html
-      attr_reader :exitstatus, :pid
+      attr_reader :exitstatus
+    
+      # Process ID of a remote command interpreter or a remote process.
+      # See note on Net::SSH::Process::Status class for more information on how this is fetched.
+      attr_reader :pid
 
       # true when process has been killed by a signal and a core dump has been generated for it.
       def coredump?
@@ -87,7 +91,7 @@ module Net::SSH # :nodoc:
         end
       end
 
-      def inspect # :nodoc:
+      def inspect #:nodoc:
         "#<#{self.class}: #{to_s}>"
       end
     end
@@ -133,8 +137,8 @@ module Net::SSH # :nodoc:
   #     # => ["", #<Net::SSH::Process::Status: pid 1744 QUIT (signal 3) core true>]
   #   Note that just closing stdin is not enough for PTY. You should explicitly send VEOF as a first char of a line, see termios(3).
   module Open3
-    SSH_EXTENDED_DATA_STDERR = 1 # :nodoc:
-    REMOTE_PACKET_THRESHOLD = 512 # headers etc # :nodoc:
+    SSH_EXTENDED_DATA_STDERR = 1 #:nodoc:
+    REMOTE_PACKET_THRESHOLD = 512 # headers etc #:nodoc:
 
     # Captures stdout only. Returns [String, Process::Status]
     def capture2(*args)
@@ -310,7 +314,7 @@ module Net::SSH # :nodoc:
       end
     end
 
-    REDIRECT_MAPPING = { # :nodoc:
+    REDIRECT_MAPPING = { #:nodoc:
       in: '<',
       out: '>',
       err: '2>'
@@ -374,7 +378,7 @@ module Net::SSH # :nodoc:
     end
   end
 
-  class Connection::Session # :nodoc: all
+  class Connection::Session #:nodoc: all
     include Open3
 
     alias_method_once :initialize_without_open3, :initialize
@@ -446,7 +450,7 @@ module Net::SSH # :nodoc:
     end
   end
 
-  class Connection::Channel # :nodoc: all
+  class Connection::Channel #:nodoc: all
     attr_reader :open3_close_semaphore, :open3_exception, :open3_waiter_thread
 
     alias_method_once :initialize_without_open3, :initialize
