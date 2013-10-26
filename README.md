@@ -1,6 +1,8 @@
 net-ssh-open3
 =============
 
+[![Gem Version](https://badge.fury.io/rb/net-ssh-open3.png)](http://badge.fury.io/rb/net-ssh-open3)
+
 Thread-safe Open3 for Net::SSH.
 
 Adds some Open3-style functions to Net::SSH::Connection::Session.
