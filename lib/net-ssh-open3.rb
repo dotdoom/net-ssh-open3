@@ -256,7 +256,7 @@ module Net::SSH # :nodoc:
             stderr.flush
           end
         else
-          logger.warn("unknown extended data type #{type}")
+          logger.warn("unknown extended data type #{type}") if logger
         end
       end
 
