@@ -140,6 +140,8 @@ module Net::SSH #:nodoc:
     SSH_EXTENDED_DATA_STDERR = 1 #:nodoc:
     REMOTE_PACKET_THRESHOLD = 512 # headers etc #:nodoc:
 
+    private_constant :SSH_EXTENDED_DATA_STDERR, :REMOTE_PACKET_THRESHOLD
+
     # Captures stdout only. Returns [String, Process::Status]
     def capture2(*args)
       stdout = StringIO.new
