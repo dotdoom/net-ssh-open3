@@ -31,3 +31,4 @@ Usage example:
 Note: a single SSH session may have several channels, i.e. you may run several Open3 methods on the same session in parallel (in different threads).
 
 For more information please see documentation inside.
+Recommended starting point is "Methods included from Net::SSH::Open3" in Net::SSH::Connection::Session.

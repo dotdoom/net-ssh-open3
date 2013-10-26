@@ -3,10 +3,9 @@ require 'thread' # ConditionVariable
 require 'net/ssh' # Monkeypatching
 require 'stringio' # StringIO for capture*
 
-# TODO: allow passing pipes? watch closing
-
-class Class #:nodoc:
+class Class
   unless method_defined?(:alias_method_once)
+    private
     # Create an alias +new_method+ to +old_method+ unless +new_method+ is already defined.
     def alias_method_once(new_method, old_method) #:nodoc:
       alias_method new_method, old_method unless method_defined?(new_method)
@@ -14,8 +13,8 @@ class Class #:nodoc:
   end
 end
 
-module Net::SSH #:nodoc:
-  module Process #:nodoc:
+module Net::SSH
+  module Process
     # Encapsulates the information on the status of remote process, similar to ::Process::Status.
     #
     # Note that it's impossible to retrieve PID (process ID) via an SSH channel (thus impossible to properly signal it).
@@ -91,7 +90,8 @@ module Net::SSH #:nodoc:
         end
       end
 
-      def inspect #:nodoc:
+      # Inspect this instance.
+      def inspect
         "#<#{self.class}: #{to_s}>"
       end
     end
@@ -340,7 +340,7 @@ module Net::SSH #:nodoc:
                   env: env, pty: pty_options) if logger.respond_to?(:init)
 
       begin
-        channel = self.open3_open_channel do |channel|
+        channel = open3_open_channel do |channel|
           channel.request_pty(Hash === pty_options ? pty_options : {}) if pty_options
           env.each_pair { |var_name, var_value| channel.env(var_name, var_value) }
 
@@ -380,10 +380,13 @@ module Net::SSH #:nodoc:
     end
   end
 
-  class Connection::Session #:nodoc: all
+  # All methods in this class were created for private use of Net::SSH::Open3.
+  # You probably won't need to call them directly.
+  class Connection::Session
     include Open3
 
     alias_method_once :initialize_without_open3, :initialize
+	# Overridden version of +initialize+ which starts an Open3 SSH loop.
     def initialize(*args, &block)
       initialize_without_open3(*args, &block)
 
@@ -394,10 +397,10 @@ module Net::SSH #:nodoc:
       pinger_reader, @open3_pinger_writer = IO.pipe
       listen_to(pinger_reader) { pinger_reader.readpartial(1) }
 
-      # TODO(artem): kill this thread on program exit
       @session_loop = Thread.new { open3_loop }
     end
 
+    private
     def open3_open_channel(type = 'session', *extra, &on_confirm)
       @open3_channels_mutex.synchronize do
         local_id = get_next_channel_id
@@ -422,7 +425,6 @@ module Net::SSH #:nodoc:
       end
     end
 
-    private
     def open3_ping
       @open3_pinger_writer.write(?P)
     end
@@ -452,10 +454,20 @@ module Net::SSH #:nodoc:
     end
   end
 
-  class Connection::Channel #:nodoc: all
-    attr_reader :open3_close_semaphore, :open3_exception, :open3_waiter_thread
+  # All methods in this class were created for private use of Net::SSH::Open3.
+  # You probably won't need to call them directly.
+  class Connection::Channel
+    # A semaphore to flag this channel as closed.
+    attr_reader :open3_close_semaphore
+
+    # An exception tracked during channel opening, if any.
+    attr_reader :open3_exception
+
+    # Waiter thread that watches this channel.
+    attr_reader :open3_waiter_thread
 
     alias_method_once :initialize_without_open3, :initialize
+    # Overridden version of +initialize+ which creates synchronization objects.
     def initialize(*args, &block)
       initialize_without_open3(*args, &block)
       @open3_close_semaphore = ConditionVariable.new
@@ -465,6 +477,7 @@ module Net::SSH #:nodoc:
     end
 
     alias_method_once :do_close_without_open3, :do_close
+    # Overridden version of +do_close+ which tracks exceptions and sync.
     def do_close(*args)
       do_close_without_open3(*args)
     rescue
@@ -474,6 +487,7 @@ module Net::SSH #:nodoc:
     end
 
     alias_method_once :do_open_confirmation_without_open3, :do_open_confirmation
+    # Overridden version of +do_open_confirmation+ which tracks exceptions.
     def do_open_confirmation(*args)
       do_open_confirmation_without_open3(*args)
       # Do not signal right now: we will signal as soon as PID arrives.
@@ -482,6 +496,7 @@ module Net::SSH #:nodoc:
     end
 
     alias_method_once :do_open_failed_without_open3, :do_open_failed
+    # Overridden version of +do_open_failed+ which tracks exceptions and sync.
     def do_open_failed(*args)
       do_open_failed_without_open3(*args)
     rescue
@@ -491,25 +506,31 @@ module Net::SSH #:nodoc:
       open3_signal_close
     end
 
+    # +waiter_thread+ setter which may only be called once with non-false argument.
     def open3_waiter_thread=(value)
       @open3_waiter_thread = value unless @open3_waiter_thread
     end
 
+    # Suspend current thread execution until this channel is opened.
+    # Raises an exception if tracked during opening.
     def open3_wait_open
       @open3_open_mutex.synchronize { @open3_open_semaphore.wait(@open3_open_mutex) }
       raise *open3_exception if open3_exception
       self
     end
 
+    # Wait for this channel to be closed.
     def wait
       @open3_waiter_thread.join
       self
     end
 
+    # Flag this channel as opened and deliver signals.
     def open3_signal_open
       @open3_open_mutex.synchronize { @open3_open_semaphore.signal }
     end
 
+    # Flag this channel as closed and deliver signals.
     # Should be called from within session's mutex.
     def open3_signal_close
       @open3_close_semaphore.signal
