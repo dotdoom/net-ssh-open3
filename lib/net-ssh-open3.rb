@@ -142,7 +142,7 @@ module Net::SSH
 
     private_constant :SSH_EXTENDED_DATA_STDERR, :REMOTE_PACKET_THRESHOLD
 
-    # Captures stdout only. Returns [String, Process::Status]
+    # Captures stdout only. Returns [String, Net::SSH::Process::Status]
     def capture2(*args)
       stdout = StringIO.new
       stdin_data = args.last[:stdin_data] if Hash === args.last
@@ -155,7 +155,7 @@ module Net::SSH
       end
     end
 
-    # Captures stdout and stderr into one string. Returns [String, Process::Status]
+    # Captures stdout and stderr into one string. Returns [String, Net::SSH::Process::Status]
     def capture2e(*args)
       stdout = StringIO.new
       stdin_data = args.last[:stdin_data] if Hash === args.last
@@ -169,7 +169,7 @@ module Net::SSH
       end
     end
 
-    # Captures stdout and stderr into separate strings. Returns [String, String, Process::Status]
+    # Captures stdout and stderr into separate strings. Returns [String, String, Net::SSH::Process::Status]
     def capture3(*args)
       stdout, stderr = StringIO.new, StringIO.new
       stdin_data = args.last[:stdin_data] if Hash === args.last
@@ -186,6 +186,7 @@ module Net::SSH
     # Opens pipes to a remote process.
     # Yields +stdin+, +stdout+, +stderr+, +waiter_thread+ into a block. Will wait for a process to finish.
     # Joining (or getting a value of) +waither_thread+ inside a block will wait for a process right there.
+    # 'status' Thread-Attribute of +waiter_thread+ holds an instance of Net::SSH::Process::Status for a remote process.
     # Careful: don't forget to read +stderr+, otherwise if your process generates too much stderr output
     # the pipe may overload and ssh loop will get stuck writing to it.
     def popen3(*args, &block)
@@ -380,13 +381,13 @@ module Net::SSH
     end
   end
 
-  # All methods in this class were created for private use of Net::SSH::Open3.
-  # You probably won't need to call them directly.
-  class Connection::Session
+  module Connection
+  class Session
     include Open3
 
     alias_method_once :initialize_without_open3, :initialize
-	# Overridden version of +initialize+ which starts an Open3 SSH loop.
+    # Overridden version of +initialize+ which starts an Open3 SSH loop.
+    # @private
     def initialize(*args, &block)
       initialize_without_open3(*args, &block)
 
@@ -456,7 +457,8 @@ module Net::SSH
 
   # All methods in this class were created for private use of Net::SSH::Open3.
   # You probably won't need to call them directly.
-  class Connection::Channel
+  # @private
+  class Channel
     # A semaphore to flag this channel as closed.
     attr_reader :open3_close_semaphore
 
@@ -535,5 +537,6 @@ module Net::SSH
     def open3_signal_close
       @open3_close_semaphore.signal
     end
+  end
   end
 end
