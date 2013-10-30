@@ -109,11 +109,14 @@ module Net::SSH
   #
   # *optional* +options+: options hash, keys:
   # * +redirects+: Hash of redirections which will be appended to a command line (you can't transfer a pipe to a remote system).
-  #   Key: one of +:in+, +:out+, +:err+ or a +String+, value: +Integer+ to redirect to fd, +String+ to redirect to a file.
+  #   Key: one of +:in+, +:out+, +:err+ or a +String+, value: +Integer+ to redirect to remote fd, +String+ to redirect to a file.
+  #   If a key is a Symbol, local +IO+ may be specified as a value. In this case, block receives +nil+ for the corresponding IO.
   #   Example:
   #     { '>>' => '/tmp/log', err: 1 }
   #   translates to
   #     '>>/tmp/log 2>&1'
+  #   Another example:
+  #     { in: $stdin, out: $stdout, err: $stderr }
   # * +channel_retries+: +Integer+ number of retries in case of channel open failure (ssh server usually limits a session to 10 channels),
   #   or an array of [+retries+, +delay+]
   # * +stdin_data+: for +capture*+ only, specifies data to be immediately sent to +stdin+ of a remote process.
@@ -137,15 +140,10 @@ module Net::SSH
   #     # => ["", #<Net::SSH::Process::Status: pid 1744 QUIT (signal 3) core true>]
   #   Note that just closing stdin is not enough for PTY. You should explicitly send VEOF as a first char of a line, see termios(3).
   module Open3
-    SSH_EXTENDED_DATA_STDERR = 1 #:nodoc:
-    REMOTE_PACKET_THRESHOLD = 512 # headers etc #:nodoc:
-
-    private_constant :SSH_EXTENDED_DATA_STDERR, :REMOTE_PACKET_THRESHOLD
-
     # Captures stdout only. Returns [String, Net::SSH::Process::Status]
     def capture2(*args)
       stdout = StringIO.new
-      stdin_data = args.last[:stdin_data] if Hash === args.last
+      stdin_data = extract_open3_options(args)[:stdin_data]
 
       run_popen(*args,
                 stdin: stdin_data,
@@ -158,7 +156,7 @@ module Net::SSH
     # Captures stdout and stderr into one string. Returns [String, Net::SSH::Process::Status]
     def capture2e(*args)
       stdout = StringIO.new
-      stdin_data = args.last[:stdin_data] if Hash === args.last
+      stdin_data = extract_open3_options(args)[:stdin_data]
 
       run_popen(*args,
                 stdin: stdin_data,
@@ -172,7 +170,7 @@ module Net::SSH
     # Captures stdout and stderr into separate strings. Returns [String, String, Net::SSH::Process::Status]
     def capture3(*args)
       stdout, stderr = StringIO.new, StringIO.new
-      stdin_data = args.last[:stdin_data] if Hash === args.last
+      stdin_data = extract_open3_options(args)[:stdin_data]
 
       run_popen(*args,
                 stdin: stdin_data,
@@ -190,9 +188,10 @@ module Net::SSH
     # Careful: don't forget to read +stderr+, otherwise if your process generates too much stderr output
     # the pipe may overload and ssh loop will get stuck writing to it.
     def popen3(*args, &block)
-      stdin_inner, stdin_outer = IO.pipe
-      stdout_outer, stdout_inner = IO.pipe
-      stderr_outer, stderr_inner = IO.pipe
+      redirects = extract_open3_options(args)[:redirects]
+      stdin_inner, stdin_outer = open3_ios_for(:in, redirects)
+      stdout_outer, stdout_inner = open3_ios_for(:out, redirects)
+      stderr_outer, stderr_inner = open3_ios_for(:err, redirects)
 
       run_popen(*args,
                 stdin: stdin_inner,
@@ -204,8 +203,9 @@ module Net::SSH
 
     # Yields +stdin+, +stdout-stderr+, +waiter_thread+ into a block.
     def popen2e(*args, &block)
-      stdin_inner, stdin_outer = IO.pipe
-      stdout_outer, stdout_inner = IO.pipe
+      redirects = extract_open3_options(args)[:redirects]
+      stdin_inner, stdin_outer = open3_ios_for(:in, redirects)
+      stdout_outer, stdout_inner = open3_ios_for(:out, redirects)
 
       run_popen(*args,
                 stdin: stdin_inner,
@@ -217,8 +217,9 @@ module Net::SSH
 
     # Yields +stdin+, +stdout+, +waiter_thread+ into a block.
     def popen2(*args, &block)
-      stdin_inner, stdin_outer = IO.pipe
-      stdout_outer, stdout_inner = IO.pipe
+      redirects = extract_open3_options(args)[:redirects]
+      stdin_inner, stdin_outer = open3_ios_for(:in, redirects)
+      stdout_outer, stdout_inner = open3_ios_for(:out, redirects)
 
       run_popen(*args,
                 stdin: stdin_inner,
@@ -228,6 +229,27 @@ module Net::SSH
     end
 
     private
+    def extract_open3_options(args, pop = false)
+      if Hash === args.last
+        pop ? args.pop : args.last
+      else
+        {}
+      end
+    end
+
+    def open3_ios_for(name, redirects)
+      if redirects and user_supplied_io = redirects[name] and IO === user_supplied_io
+        name == :in ? user_supplied_io : [nil, user_supplied_io]
+      else
+        IO.pipe
+      end
+    end
+
+    SSH_EXTENDED_DATA_STDERR = 1 #:nodoc:
+    REMOTE_PACKET_THRESHOLD = 512 # headers etc #:nodoc:
+
+    private_constant :SSH_EXTENDED_DATA_STDERR, :REMOTE_PACKET_THRESHOLD
+
     def install_channel_callbacks(channel, options)
       logger, stdin, stdout, stderr =
         options[:logger], options[:stdin], options[:stdout], options[:stderr]
@@ -317,19 +339,22 @@ module Net::SSH
       end
     end
 
-    REDIRECT_MAPPING = { #:nodoc:
+    REDIRECT_MAPPING = {
       in: '<',
       out: '>',
       err: '2>'
     }
+    private_constant :REDIRECT_MAPPING
 
     def run_popen(*args, internal_options)
-      options = (args.pop if Hash === args.last) || {}
+      options = extract_open3_options(args, true)
       env = (args.shift if Hash === args.first) || {}
       cmdline = args.size == 1 ? args.first : Shellwords.join(args.map(&:to_s))
 
       redirects = options[:redirects] and redirects.each_pair do |fd_and_dir, destination|
-        cmdline += " #{REDIRECT_MAPPING[fd_and_dir] || fd_and_dir}#{popen_io_name(destination)}"
+        if destination = popen_io_name(destination)
+          cmdline << " #{REDIRECT_MAPPING[fd_and_dir] || fd_and_dir}#{destination}"
+        end
       end
       logger = options[:logger]
       pty_options = options[:pty]
@@ -377,7 +402,10 @@ module Net::SSH
     end
 
     def popen_io_name(name)
-      Fixnum === name ? "&#{name}" : Shellwords.shellescape(name)
+      case name
+      when Fixnum then "&#{name}"
+      when String then Shellwords.shellescape(name)
+      end
     end
   end
 
