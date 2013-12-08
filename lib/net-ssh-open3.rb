@@ -32,9 +32,10 @@ module Net::SSH
       # Assigned only if the process has exited normally (i.e. not by a signal).
       # More information about standard exit codes: http://tldp.org/LDP/abs/html/exitcodes.html
       attr_reader :exitstatus
-    
+
       # Process ID of a remote command interpreter or a remote process.
       # See note on Net::SSH::Process::Status class for more information on how this is fetched.
+      # false if PID fetching was disabled.
       attr_reader :pid
 
       # true when process has been killed by a signal and a core dump has been generated for it.
@@ -76,7 +77,7 @@ module Net::SSH
 
       # String representation of exit status.
       def to_s
-        if @pid
+        if @pid != nil
           "pid #@pid " <<
           if exited?
             "exit #@exitstatus"
@@ -122,7 +123,8 @@ module Net::SSH
   # * +stdin_data+: for +capture*+ only, specifies data to be immediately sent to +stdin+ of a remote process.
   #   stdin is immediately closed then.
   # * +logger+: an object which responds to +debug/info/warn/error+ and optionally +init/stdin/stdout/stderr+ to log debug information
-  #   and data exchange stream
+  #   and data exchange stream.
+  # * +fetch_pid+: prepend command with 'echo $$' and capture first line of the output as PID. Defaults to true.
   # * +pty+: true or a +Hash+ of PTY settings to request a pseudo-TTY, see Net::SSH documentation for more information.
   #   A note about sending TERM/QUIT: use modes, e.g.:
   #     Net::SSH.start('localhost', ENV['USER']).capture2e('cat', pty: {
@@ -189,42 +191,48 @@ module Net::SSH
     # the pipe may overload and ssh loop will get stuck writing to it.
     def popen3(*args, &block)
       redirects = extract_open3_options(args)[:redirects]
-      stdin_inner, stdin_outer = open3_ios_for(:in, redirects)
-      stdout_outer, stdout_inner = open3_ios_for(:out, redirects)
-      stderr_outer, stderr_inner = open3_ios_for(:err, redirects)
+      local_pipes = []
+      stdin_inner, stdin_outer = open3_ios_for(:in, redirects, local_pipes)
+      stdout_outer, stdout_inner = open3_ios_for(:out, redirects, local_pipes)
+      stderr_outer, stderr_inner = open3_ios_for(:err, redirects, local_pipes)
 
       run_popen(*args,
                 stdin: stdin_inner,
                 stdout: stdout_inner,
                 stderr: stderr_inner,
                 block_pipes: [stdin_outer, stdout_outer, stderr_outer],
+                local_pipes: local_pipes,
                 &block)
     end
 
     # Yields +stdin+, +stdout-stderr+, +waiter_thread+ into a block.
     def popen2e(*args, &block)
       redirects = extract_open3_options(args)[:redirects]
-      stdin_inner, stdin_outer = open3_ios_for(:in, redirects)
-      stdout_outer, stdout_inner = open3_ios_for(:out, redirects)
+      local_pipes = []
+      stdin_inner, stdin_outer = open3_ios_for(:in, redirects, local_pipes)
+      stdout_outer, stdout_inner = open3_ios_for(:out, redirects, local_pipes)
 
       run_popen(*args,
                 stdin: stdin_inner,
                 stdout: stdout_inner,
                 stderr: stdout_inner,
                 block_pipes: [stdin_outer, stdout_outer],
+                local_pipes: local_pipes,
                 &block)
     end
 
     # Yields +stdin+, +stdout+, +waiter_thread+ into a block.
     def popen2(*args, &block)
       redirects = extract_open3_options(args)[:redirects]
-      stdin_inner, stdin_outer = open3_ios_for(:in, redirects)
-      stdout_outer, stdout_inner = open3_ios_for(:out, redirects)
+      local_pipes = []
+      stdin_inner, stdin_outer = open3_ios_for(:in, redirects, local_pipes)
+      stdout_outer, stdout_inner = open3_ios_for(:out, redirects, local_pipes)
 
       run_popen(*args,
                 stdin: stdin_inner,
                 stdout: stdout_inner,
                 block_pipes: [stdin_outer, stdout_outer],
+                local_pipes: local_pipes,
                 &block)
     end
 
@@ -237,11 +245,11 @@ module Net::SSH
       end
     end
 
-    def open3_ios_for(name, redirects)
+    def open3_ios_for(name, redirects, locals)
       if redirects and user_supplied_io = redirects[name] and IO === user_supplied_io
-        name == :in ? user_supplied_io : [nil, user_supplied_io]
+        name == :in ? [user_supplied_io, nil] : [nil, user_supplied_io]
       else
-        IO.pipe
+        IO.pipe.tap { |pipes| locals.concat pipes }
       end
     end
 
@@ -251,9 +259,15 @@ module Net::SSH
     private_constant :SSH_EXTENDED_DATA_STDERR, :REMOTE_PACKET_THRESHOLD
 
     def install_channel_callbacks(channel, options)
-      logger, stdin, stdout, stderr =
-        options[:logger], options[:stdin], options[:stdout], options[:stderr]
-      pid_initialized = false
+      logger, stdin, stdout, stderr, local_pipes =
+        options[:logger], options[:stdin], options[:stdout], options[:stderr], options[:local_pipes]
+
+      if options[:fetch_pid]
+        pid_initialized = false
+      else
+        channel.open3_waiter_thread[:status].instance_variable_set(:@pid, false)
+        pid_initialized = true
+      end
 
       channel.on_open_failed do |_channel, code, desc|
         message = "cannot open channel (error code #{code}): #{desc}"
@@ -306,16 +320,19 @@ module Net::SSH
 
       channel.on_eof do
         logger.debug('server reports EOF') if logger
-        [stdout, stderr].each { |io| io.close unless io.nil? || io.closed? }
+        [stdout, stderr].each { |io| io.close if !io.closed? && local_pipes.include?(io) }
       end
 
       channel.on_close do
         logger.debug('channel close command received, will enforce EOF afterwards') if logger
-        if stdin.is_a?(IO)
-          self.stop_listening_to(stdin)
-          stdin.close unless stdin.closed?
+        begin
+          if stdin.is_a?(IO)
+            self.stop_listening_to(stdin)
+            stdin.close if !stdin.closed? && local_pipes.include?(stdin)
+          end
+        ensure
+          channel.do_eof # Should already be done, but just in case.
         end
-        channel.do_eof # Should already be done, but just in case.
       end
 
       if stdin.is_a?(IO)
@@ -361,22 +378,29 @@ module Net::SSH
       retries, delay = options[:channel_retries]
       retries ||= 5
       delay ||= 1
+      fetch_pid = options[:fetch_pid] != false
+      local_pipes = Array(internal_options[:local_pipes])
 
       logger.init(host: self.transport.host_as_string, cmdline: cmdline,
                   env: env, pty: pty_options) if logger.respond_to?(:init)
 
+      cmdline = "echo $$; exec #{cmdline}" if fetch_pid
+
       begin
         channel = open3_open_channel do |channel|
+          channel.open3_signal_open unless fetch_pid
           channel.request_pty(Hash === pty_options ? pty_options : {}) if pty_options
           env.each_pair { |var_name, var_value| channel.env(var_name, var_value) }
 
-          channel.exec("echo $$; #{cmdline}")
+          channel.exec(cmdline)
 
           install_channel_callbacks channel,
             stdin: internal_options[:stdin],
             stdout: internal_options[:stdout],
             stderr: internal_options[:stderr],
-            logger: logger
+            logger: logger,
+            local_pipes: local_pipes,
+            fetch_pid: fetch_pid
         end.open3_wait_open
       rescue ChannelOpenFailed
         logger.warn("channel open failed: #$!, #{retries} retries left") if logger
@@ -393,12 +417,7 @@ module Net::SSH
         channel.wait
       end
     ensure
-      [
-        *internal_options[:block_pipes],
-        internal_options[:stdin],
-        internal_options[:stdout],
-        internal_options[:stderr]
-      ].each { |io| io.close if io.is_a?(IO) && !io.closed? }
+      local_pipes.each { |io| io.close unless io.closed? }
     end
 
     def popen_io_name(name)
@@ -423,10 +442,16 @@ module Net::SSH
 
       # open3_ping method will pull waiter thread out of select(2) call
       # to update watched Channels and IOs and process incomes.
-      pinger_reader, @open3_pinger_writer = IO.pipe
-      listen_to(pinger_reader) { pinger_reader.readpartial(1) }
+      @open3_pinger_reader, @open3_pinger_writer = IO.pipe
+      listen_to(@open3_pinger_reader) { @open3_pinger_reader.readpartial(1) }
 
       @session_loop = Thread.new { open3_loop }
+    end
+
+    alias_method_once :close_without_open3, :close
+    def close(*args, &block)
+      @open3_closing = true
+      close_without_open3(*args, &block).tap { open3_ping rescue nil }
     end
 
     private
@@ -467,6 +492,7 @@ module Net::SSH
           w = r.select { |w2| w2.respond_to?(:pending_write?) && w2.pending_write? }
         end
 
+        break if @open3_closing
         readers, writers, = Compat.io_select(r, w, nil, nil)
         postprocess(readers, writers)
       end
@@ -480,6 +506,8 @@ module Net::SSH
       end
     rescue
       warn "Caught exception in an Open3 loop: #$!; thread terminating, connections will hang."
+    ensure
+      [@open3_pinger_reader, @open3_pinger_writer].each(&:close)
     end
   end
 

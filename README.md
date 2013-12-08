@@ -32,3 +32,6 @@ Note: a single SSH session may have several channels, i.e. you may run several O
 
 For more information please see documentation inside.
 Recommended starting point is "Methods included from Net::SSH::Open3" in Net::SSH::Connection::Session.
+
+TODO:
+ don't require block
