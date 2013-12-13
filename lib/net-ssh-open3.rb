@@ -149,8 +149,7 @@ module Net::SSH
 
       run_popen(*args,
                 stdin: stdin_data,
-                stdout: stdout,
-                block_pipes: [stdout]) do |stdout, waiter_thread|
+                stdout: stdout) do |waiter_thread|
         [stdout.string, waiter_thread.value]
       end
     end
@@ -163,8 +162,7 @@ module Net::SSH
       run_popen(*args,
                 stdin: stdin_data,
                 stdout: stdout,
-                stderr: stdout,
-                block_pipes: [stdout]) do |stdout, waiter_thread|
+                stderr: stdout) do |waiter_thread|
         [stdout.string, waiter_thread.value]
       end
     end
@@ -177,8 +175,7 @@ module Net::SSH
       run_popen(*args,
                 stdin: stdin_data,
                 stdout: stdout,
-                stderr: stderr,
-                block_pipes: [stdout, stderr]) do |stdout, stderr, waiter_thread|
+                stderr: stderr) do |waiter_thread|
         [stdout.string, stderr.string, waiter_thread.value]
       end
     end
@@ -320,7 +317,7 @@ module Net::SSH
 
       channel.on_eof do
         logger.debug('server reports EOF') if logger
-        [stdout, stderr].each { |io| io.close if !io.closed? && local_pipes.include?(io) }
+        [stdout, stderr].each { |io| io.close if local_pipes.include?(io) && !io.closed? }
       end
 
       channel.on_close do

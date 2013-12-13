@@ -1,7 +1,7 @@
 Gem::Specification.new do |s|
   s.name        = 'net-ssh-open3'
-  s.version     = '0.1.4'
-  s.date        = '2013-12-08'
+  s.version     = '0.1.5'
+  s.date        = '2013-12-14'
   s.summary     = 'Thread-safe Open3 for Net::SSH'
   s.authors     = ['Artem Sheremet']
   s.email       = 'dot.doom@gmail.com'
