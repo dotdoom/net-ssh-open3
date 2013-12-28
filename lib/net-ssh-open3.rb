@@ -370,7 +370,7 @@ module Net::SSH
           cmdline << " #{REDIRECT_MAPPING[fd_and_dir] || fd_and_dir}#{destination}"
         end
       end
-      logger = options[:logger]
+      logger = options[:logger] || @open3_logger
       pty_options = options[:pty]
       retries, delay = options[:channel_retries]
       retries ||= 5
@@ -428,6 +428,8 @@ module Net::SSH
   module Connection
   class Session
     include Open3
+
+    attr_accessor :open3_logger
 
     alias_method_once :initialize_without_open3, :initialize
     # Overridden version of +initialize+ which starts an Open3 SSH loop.
