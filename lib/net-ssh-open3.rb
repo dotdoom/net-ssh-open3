@@ -26,7 +26,7 @@ module Net::SSH
     # As a workaround one can request a PTY and send SIGINT or SIGQUIT via ^C, ^\ or other sequences,
     # see 'pty' option in Net::SSH::Open3 for more information.
     #
-    # Open3 prepends your command with 'echo $$; ' which will echo PID of your process, then intercepts this line from STDOUT.
+    # See fetch_pid option for more information on Open3 workaround for this.
     class Status
       # Integer exit code in range 0..255, 0 usually meaning success.
       # Assigned only if the process has exited normally (i.e. not by a signal).
@@ -99,48 +99,76 @@ module Net::SSH
   end
 
   # Net::SSH Open3 extensions.
-  # All methods have the same argument list.
+  #   All methods have similar argument list:
   #
-  # *optional* +env+: custom environment variables +Hash+. Note that SSH server typically restricts changeable variables to a very small set,
-  # e.g. for OpenSSH see +AcceptEnv+ in +/etc/ssh/sshd_config+ (+AcceptEnv+ +LANG+ +LC_*+)
+  #     method_name([env,] command... [, options])
   #
-  # +command+: a single shell command (like in +sh+ +-c+), or an executable program.
+  #   env: hash
+  #     custom environment variables. Note that SSH server typically restricts changeable variables to a very small set,
+  #     e.g. for OpenSSH see AcceptEnv in /etc/ssh/sshd_config (AcceptEnv LANG LC_*)
   #
-  # *optional* +arg1+, +arg2+, +...+: arguments to an executable mentioned above.
+  #   command...:
+  #     commandline              : command line string that is passed to SSH as-is
+  #     cmdname, arg1, arg2, ... : command name and one or more arguments (no shell expansion will be performed)
   #
-  # *optional* +options+: options hash, keys:
-  # * +redirects+: Hash of redirections which will be appended to a command line (you can't transfer a pipe to a remote system).
-  #   Key: one of +:in+, +:out+, +:err+ or a +String+, value: +Integer+ to redirect to remote fd, +String+ to redirect to a file.
-  #   If a key is a Symbol, local +IO+ may be specified as a value. In this case, block receives +nil+ for the corresponding IO.
-  #   Example:
-  #     { '>>' => '/tmp/log', err: 1 }
-  #   translates to
-  #     '>>/tmp/log 2>&1'
-  #   Another example:
-  #     { in: $stdin, out: $stdout, err: $stderr }
-  # * +channel_retries+: +Integer+ number of retries in case of channel open failure (ssh server usually limits a session to 10 channels),
-  #   or an array of [+retries+, +delay+]
-  # * +stdin_data+: for +capture*+ only, specifies data to be immediately sent to +stdin+ of a remote process.
-  #   stdin is immediately closed then.
-  # * +logger+: an object which responds to +debug/info/warn/error+ and optionally +init/stdin/stdout/stderr+ to log debug information
-  #   and data exchange stream.
-  # * +fetch_pid+: prepend command with 'echo $$' and capture first line of the output as PID. Defaults to true.
-  # * +pty+: true or a +Hash+ of PTY settings to request a pseudo-TTY, see Net::SSH documentation for more information.
-  #   A note about sending TERM/QUIT: use modes, e.g.:
-  #     Net::SSH.start('localhost', ENV['USER']).capture2e('cat', pty: {
-  #         modes: {
-  #           Net::SSH::Connection::Term::VINTR => 0x01020304, # INT on this 4-byte-sequence
-  #           Net::SSH::Connection::Term::VQUIT => 0xdeadbeef, # QUIT on this 4-byte sequence
-  #           Net::SSH::Connection::Term::VEOF => 0xfacefeed, # EOF sequence
-  #           Net::SSH::Connection::Term::ECHO => 0, # disable echoing
-  #           Net::SSH::Connection::Term::ISIG => 1 # enable sending signals
-  #         }
-  #       },
-  #       stdin_data: [0xDEADBEEF].pack('L'),
-  #       logger: Class.new { alias method_missing puts; def respond_to?(_); true end }.new)
-  #     # log skipped ...
-  #     # => ["", #<Net::SSH::Process::Status: pid 1744 QUIT (signal 3) core true>]
-  #   Note that just closing stdin is not enough for PTY. You should explicitly send VEOF as a first char of a line, see termios(3).
+  #   options: hash
+  #     redirection:
+  #       key:
+  #         FD            : single file descriptor in child process
+  #         [FD, FD, ...] : multiple file descriptors in child process
+  #
+  #       value:
+  #         FD                           : redirect to file descriptor in current process
+  #         string                       : redirect to local file with open(string, "r" or "w")
+  #         [string]                     : redirect to local file with open(string, File::RDONLY)
+  #         [string, open_mode]          : redirect to local file with open(string, open_mode, 0644)
+  #         [string, open_mode, perm]    : redirect to local file with open(string, open_mode, perm)
+  #         [:child, FD]                 : redirect to the redirected file descriptor
+  #         [:remote, string]            : redirect to remote file using shell redirections
+  #         [:remote, string, open_mode] : redirect to remote file using shell redirections with mode ("r", "w" or "a")
+  #         :close                       : close the file descriptor in child process
+  #
+  #       FD is one of the following
+  #         :in     : the file descriptor 0 which is the standard input
+  #         :out    : the file descriptor 1 which is the standard output
+  #         :err    : the file descriptor 2 which is the standard error
+  #         integer : the file descriptor of specified the integer
+  #         io      : the file descriptor specified as io.fileno
+  #
+  #     connection:
+  #       channel_retries:
+  #         integer : number of retries in case of channel open failure (ssh server usually limits a session to 10 channels)
+  #         array   : 2 items - number of retries and delay between retries, in seconds
+  #       fetch_pid      : prepend a command with 'echo $$; exec' and capture the first output line as PID. Defaults to true
+  #       pty            :
+  #         true : enable remote PTY with default settings
+  #         hash : enable remote PTY and set it up. See Net:SSH documentation for more information.
+  #
+  #         Note 1: use modes to send TERM/QUIT, e.g.:
+  #
+  #         Net::SSH.start('localhost', ENV['USER']).capture2e('cat', pty: {
+  #             modes: {
+  #               Net::SSH::Connection::Term::VINTR => 0x01020304, # INT on this 4-byte-sequence
+  #               Net::SSH::Connection::Term::VQUIT => 0xdeadbeef, # QUIT on this 4-byte sequence
+  #               Net::SSH::Connection::Term::VEOF => 0xfacefeed, # EOF sequence
+  #               Net::SSH::Connection::Term::ECHO => 0, # disable echoing
+  #               Net::SSH::Connection::Term::ISIG => 1 # enable sending signals
+  #             }
+  #           },
+  #           stdin_data: [0xDEADBEEF].pack('L'),
+  #           logger: Class.new { alias method_missing puts; def respond_to?(_); true end }.new)
+  #         # log skipped ...
+  #         # => ["", #<Net::SSH::Process::Status: pid 1744 QUIT (signal 3) core true>]
+  #
+  #         Note 2: just closing stdin is not enough for PTY.
+  #         You should explicitly send VEOF as a first char of a line, see termios(3).
+  #
+  #     for capture* methods only:
+  #       stdin_data : string data to pass to stdin of the newly created process at once
+  #
+  #     logging:
+  #    	  logger : an object which responds to debug/info/warn/error and optionally init/stdin/stdout/stderr
+  #                to track debug information and the data exchange stream
   module Open3
     # Captures stdout only. Returns [String, Net::SSH::Process::Status]
     def capture2(*args)
